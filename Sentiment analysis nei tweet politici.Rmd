@@ -1,0 +1,688 @@
+---
+title: "Sentiment analysis nei tweet politici"
+author: "Marco Campedel"
+output:
+  ioslides_presentation:
+    css: style.css
+    #incremental: yes
+editor_options:
+  chunk_output_type: inline
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = FALSE, message = FALSE, warning = FALSE)
+```
+
+## Introduzione
+In quest'analisi mi sono proposto di correlare i tweet di due figure politiche, le più in vista in questo momento: il presidente del Consiglio dei Ministri Giuseppe Conte e il segretario del pratito Lega Nord Matteo Salvini.
+Nello specifico mi sono chiesto quale fosse il linguaggio preferito da queste due figure e come questo influenzi il pubblico che legge i loro tweet.
+
+## Raccolta dei dati
+Per effettuare quest'analisi i dati necessari sono
+
+* i tweet delle due figure politiche prese in considerazione
+* i tweet dei loro relativi supporter, generalizzati come i tweet contenenti #conte e #salvini
+
+## rtweet
+La libreria più completa per sfruttare le API di Twitter all'interno di R è [rtweet](https://rtweet.info/).
+Nel caso di quest'analisi possiamo ottenere
+
+* i tweet di specifici profili con la funzione `get_timelines`
+* i tweet contenenti un determinato testo con la funzione `search_tweets`
+
+### Limitazioni
+Putroppo le API di twitter hanno delle grandi limitazioni, infatti nel caso di tweet di
+
+* specifici profili il limite è di 3200 tweets
+* tweet contenenti un deteminato testo il limite è di
+  + 18000 tweets ogni 15 minuti
+  + i tweet nel range 9 giorni fa - ora
+
+Un'altra limitazione in questa presentazione è il fatto che il metodo di autenticazione utilizzato da rtweet non è supporato da knit, quindi ho dovuto salvare i due tibble ottenuti in un file .RData.
+
+### Codice
+```{r eval = FALSE}
+tweets_hconte_raw <- search_tweets(
+  "#conte", n = 18000,
+  retryonratelimit = TRUE, include_rts = FALSE
+)
+tweets_hsalvini_raw <- search_tweets(
+  "#salvini", n = 18000,
+  retryonratelimit = TRUE, include_rts = FALSE
+)
+
+tweets_conte_raw <- get_timelines(c("GiuseppeConteIT"), n = 3200)
+tweets_salvini_raw <- get_timelines(c("matteosalvinimi"), n = 3200)
+
+save(tweets_conte_raw,
+     tweets_salvini_raw,
+     tweets_hconte_raw,
+     tweets_hsalvini_raw,
+     file = "tweetsRaw.RData")
+```
+
+
+## Riordinamento dei dati
+Il tibble restituito dalle funzioni di rtweet ha numerose informazioni; quelle che ci servono sono solamente
+* created_at, indicante il datetime di creazione del tweet
+* text, il testo del tweet
+* is_retweet, se impostato a TRUE indica che il tweet è un retweet, altrimenti il suo valore non è impostato
+```{r}
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(rtweet)
+library(tidyr)
+library(stringr)
+
+load("tweetsRaw.RData")
+
+
+tweets_conte <- tweets_conte_raw %>%
+  select(created_at, text, is_retweet)
+
+tweets_salvini <- tweets_salvini_raw %>%
+  select(created_at, text, is_retweet)
+```
+
+### Selezione della località del tweet
+Per quanto riguarda i tweet ricercati per hashtag c'è bisogno di alcune attenzioni in più: per prima cosa per assicurarmi che i tweet che andrò ad analizzare siano in italiano posso sfruttare il campo lang, indicante la lingua del tweet che Twitter ha rilevato automaticamente. Nonostante questa rilevazione non sia perfetta l'alto numero di Tweet mi permette di poter tralasciare il fatto che i falsi positivi vengano eliminati nel caso di mancata classificazione o tenuti in caso di errata classificazione.
+
+### Eliminazione dei fattori non rilevanti
+Come seconda cosa, durante l'analisi mi sono accorto che un numero consistente di Tweet contenenti #conte riguardassero Antonio Conte, tecnico della squadra calcistica Inter.
+Per filtrarli ho eliminato i termini che inquinanvano l'analisi, come "antonio", "inter" o "hakimi" (futuro componente della squadra Inter trending in questo momento).
+```{r}
+tweets_hconte <- tweets_hconte_raw %>%
+  filter(lang == "it") %>%
+  select(created_at, text, is_retweet) %>%
+  mutate(text = tolower(text)) %>%
+  filter(!str_detect(text, "hakimi")) %>%
+  filter(!str_detect(text, "antonio")) %>%
+  filter(!str_detect(text, "calcio")) %>%
+  filter(!str_detect(text, "inter")) %>%
+  filter(!str_detect(text, "juve"))
+```
+
+Un altro fattore anomalo è il termine "burp": questa parola è posta alla fine di ogni tweet di un account parodistico di Matteo Salvini molto attivo in questo periodo.
+```{r}
+tweets_hsalvini <- tweets_hsalvini_raw %>%
+  filter(lang == "it") %>%
+  select(created_at, text, is_retweet) %>%
+  mutate(text = tolower(text)) %>%
+  filter(!str_detect(text, "burp"))
+```
+
+### Impostare lo stesso datetime di inizio
+Per essere sicuro che i tweet analizzati, sia per quanto riguarda i singoli profili che per le ricerche per hashtag, inizino nello stesso datetime ho selezionato il primo tweet per datetime di ognuna delle due figure e li ho confrontati. Quello pubblicato dopo nel tempo determinerà il datetime di inizio.
+```{r}
+hsalvini_first_tweet <- (tweets_hsalvini %>%
+  arrange(created_at) %>%
+  slice_head())[["created_at"]]
+hconte_first_tweet <- (tweets_hconte %>%
+  arrange(created_at) %>%
+  slice_head())[["created_at"]]
+
+if(hsalvini_first_tweet >= hconte_first_tweet) {
+  tweets_hconte <-
+    filter(tweets_hconte, created_at >= hsalvini_first_tweet)
+  tweets_conte <-
+    filter(tweets_conte, created_at >= hsalvini_first_tweet)
+  tweets_salvini <-
+    filter(tweets_salvini, created_at >= hsalvini_first_tweet)
+} else {
+  tweets_hsalvini <-
+    filter(tweets_hsalvini, created_at >= hconte_first_tweet)
+  tweets_conte <-
+    filter(tweets_conte, created_at >= hconte_first_tweet)
+  tweets_salvini <-
+    filter(tweets_salvini, created_at >= hconte_first_tweet)
+}
+```
+
+### Visualizziamo i tibble ottenuti
+```{r}
+tweets_conte %>%
+  arrange(created_at)
+tweets_salvini %>%
+  arrange(created_at)
+
+tweets_hconte %>%
+  arrange(created_at)
+tweets_hsalvini %>%
+  arrange(created_at)
+```
+
+## Uniamo i tibble
+Uniamo i tibble per averne solo uno pre ogni tipo di analisi.
+Ancora una volta, per eliminare il rumore, bisogna filtrare gli URL.
+```{r}
+tweets_politics <- 
+  bind_rows(tweets_conte %>% mutate(person = "Conte"),
+            tweets_salvini %>% mutate(person = "Salvini"))
+
+tweets_politics
+
+
+htweets_politics <- 
+  bind_rows(tweets_hconte %>% mutate(person = "Conte"),
+            tweets_hsalvini %>% mutate(person = "Salvini")) %>%
+  mutate(text = gsub("https(.*)", "", text))
+
+htweets_politics
+```
+
+# Analisi introduttiva
+
+## Frequenza dei tweet
+Per confrontare la frequenza dei tweet è utile visualizzarla in un istogramma relazionata al tempo, in particolare per ogni giorno verranno visualizzati il numero dei post.
+
+### Conte e Salvini
+Vediamo la frequenza di tweet di Conte vs Salvini.
+```{r}
+ggplot(tweets_politics, aes(x = created_at, fill = person)) +
+  geom_histogram(bins = 9, show.legend = FALSE) +
+  facet_wrap(~person, ncol = 1) +
+  xlab("Giorno") +
+  ylab("Numero tweet")
+```
+
+### #Conte e #Salvini
+Vediamo la frequenza di tweet contenenti gli hashtag Conte e Salvini.
+```{r}
+ggplot(htweets_politics, aes(x = created_at, fill = person)) +
+  geom_histogram(bins = 9, show.legend = FALSE) +
+  facet_wrap(~person, ncol = 1) +
+  xlab("Giorno") +
+  ylab("Numero tweet")
+```
+
+# Text mining
+## Tokenization
+Per effettuare la tokenizzazione sono stati rimossi i retweet, in modo da avere solo contenuti ex novo, e sono state rimosse le [stopwords](https://github.com/stopwords-iso/stopwords-it/blob/master/stopwords-it.txt) italiane, ottenute dalla [repository di Stopwords Iso](https://github.com/stopwords-iso/stopwords-it).
+```{r}
+library(tidytext)
+
+stopwords <- scan("stopwords-it.txt",
+                  what = "",
+                  sep = "\n",
+                  encoding = "UTF-8")
+remove_reg <- "&amp;|&lt;|&gt;"
+
+tidy_tweets_politics <- tweets_politics %>%
+  filter(is_retweet == FALSE) %>%
+  select(-is_retweet) %>%
+  mutate(text = str_remove_all(text, remove_reg)) %>%
+  unnest_tokens(word, text, token = "tweets") %>%
+  filter(!word %in% stop_words$word,
+         !word %in% str_remove_all(stop_words$word, "'"),
+         str_detect(word, "[a-z]"))
+tidy_tweets_politics <-
+  filter(tidy_tweets_politics, !word %in% stopwords)
+
+tidy_htweets_politics <- htweets_politics %>%
+  filter(is_retweet == FALSE) %>%
+  select(-is_retweet) %>%
+  mutate(text = str_remove_all(text, remove_reg)) %>%
+  unnest_tokens(word, text, token = "tweets") %>%
+  filter(!word %in% stop_words$word,
+         !word %in% str_remove_all(stop_words$word, "'"),
+         str_detect(word, "[a-z]"))
+tidy_htweets_politics <-
+  filter(tidy_htweets_politics, !word %in% stopwords)
+```
+
+## Parola maggiormente usata
+Vediamo la parola maggiormente presente nei tweet.
+### Conte e Salvini
+```{r}
+frequency_politics <- tidy_tweets_politics %>%
+  group_by(person) %>%
+  count(word, sort = TRUE) %>%
+  left_join(tidy_tweets_politics %>%
+              group_by(person) %>% 
+              summarise(total = n())) %>%
+  mutate(freq = n/total)
+
+frequency_politics %>%
+  filter(person == "Conte")
+
+frequency_politics %>%
+  filter(person == "Salvini")
+```
+### #Conte e #Salvini
+```{r}
+hfrequency_politics <- tidy_htweets_politics %>%
+  group_by(person) %>%
+  count(word, sort = TRUE) %>%
+  left_join(tidy_htweets_politics %>%
+              group_by(person) %>% 
+              summarise(total = n())) %>%
+  mutate(freq = n/total)
+
+hfrequency_politics %>%
+  filter(person == "Conte")
+
+hfrequency_politics %>%
+  filter(person == "Salvini")
+```
+
+## Graficazione dell'uso delle parole
+### Spread
+Per ottenere una tabella in cui associamo una parola con la presenza all'interno dei tweet di/riguardanti l'uno o l'altro personaggio facciamo uno spread.
+```{r}
+frequency_politics <- frequency_politics %>% 
+  select(person, word, freq) %>% 
+  spread(person, freq) %>%
+  arrange(Conte, Salvini)
+
+hfrequency_politics <- hfrequency_politics %>% 
+  select(person, word, freq) %>% 
+  spread(person, freq) %>%
+  arrange(Conte, Salvini)
+```
+
+### Conte e Salvini
+```{r}
+library(scales)
+
+frequency_politics %>%
+  ggplot(aes(Conte, Salvini)) +
+    geom_jitter(alpha = 0.25,
+                size = 1,
+                width = 0.25,
+                height = 0.25) +
+    geom_text(aes(label = word), check_overlap = TRUE) +
+    scale_x_log10(labels = percent_format()) +
+    scale_y_log10(labels = percent_format()) +
+    geom_abline(color = "red")
+```
+### #Conte e #Salvini
+```{r}
+hfrequency_politics %>%
+  ggplot(aes(Conte, Salvini)) +
+    geom_jitter(alpha = 0,
+                size = 0.75,
+                width = 0.25,
+                height = 0.25) +
+    geom_text(aes(label = word), check_overlap = TRUE) +
+    scale_x_log10(labels = percent_format()) +
+    scale_y_log10(labels = percent_format()) +
+    geom_abline(color = "red")
+```
+
+## Graficazione della differenza dell'uso delle parole
+Per graficare la differenza nell'uso delle parole dobbiamo calcolare il **rapporto di probabilità in scala logaritmica** con la formula
+$$\mathrm{log\ odds\ ratio} = \log_2 \frac{\frac{n_D + 1}{t_D + 1}}{\frac{n_G + 1}{t_G + 1}}$$
+In questo modo avremo un indice variabile tra 1 e -1 in cui se una parola è stata usata il doppio nell'ambito di Salvini rispetto a quello di Conte l'indice sarà 1, se una parola è stata usata il doppio nell'ambito di Conte rispetto a quello di Salvini l'indice sarà -1.
+
+Per evitare che i tag influsicano su questa analisi dobbiamo eliminarli.
+```{r}
+word_ratios_politics <- tidy_tweets_politics %>%
+  filter(!str_detect(word, "^@")) %>%
+  count(word, person) %>%
+  group_by(word) %>%
+  filter(sum(n) >= 10) %>%
+  ungroup() %>%
+  spread(person, n, fill = 0) %>%
+  mutate_if(is.numeric, list(~(. + 1) / (sum(.) + 1))) %>%
+  mutate(logratio = log(Salvini / Conte)) %>%
+  arrange(desc(logratio))
+
+word_ratios_hpolitics <- tidy_htweets_politics %>%
+  filter(!str_detect(word, "^@")) %>%
+  count(word, person) %>%
+  group_by(word) %>%
+  filter(sum(n) >= 10) %>%
+  ungroup() %>%
+  spread(person, n, fill = 0) %>%
+  mutate_if(is.numeric, list(~(. + 1) / (sum(.) + 1))) %>%
+  mutate(logratio = log(Salvini / Conte)) %>%
+  arrange(desc(logratio))
+```
+
+### Parole più usate da Conte
+```{r}
+word_ratios_politics %>% 
+  arrange(logratio)
+```
+
+### Parole più usate nei tweet #Conte
+```{r}
+word_ratios_hpolitics %>% 
+  arrange(logratio)
+```
+
+### Parole più usate da Salvini
+```{r}
+word_ratios_politics %>% 
+  arrange(-logratio)
+```
+
+### Parole più usate nei tweet #Salvini
+```{r}
+word_ratios_hpolitics %>% 
+  arrange(-logratio)
+```
+
+### Parole usate ugualmente nei tweet di Conte e di Salvini
+```{r}
+word_ratios_politics %>% 
+  arrange(abs(logratio))
+```
+
+### Parole usate ugualmente nei tweet con #Conte e di #Salvini
+```{r}
+word_ratios_hpolitics %>% 
+  arrange(abs(logratio))
+```
+
+### Grafichiamo
+Conte vs Salvini
+```{r}
+word_ratios_politics %>%
+  group_by(logratio < 0) %>%
+  top_n(10, abs(logratio)) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ylab("log odds ratio (Conte/Salvini)")
+```
+
+\#Conte vs #Salvini
+```{r}
+word_ratios_hpolitics %>%
+  group_by(logratio < 0) %>%
+  top_n(10, abs(logratio)) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, logratio)) %>%
+  ggplot(aes(word, logratio, fill = logratio < 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ylab("log odds ratio (#Conte/#Salvini)")
+```
+
+## Cambio nell'uso delle parole
+Per poter graficare il cambio nell'uso delle parole dobbiamo iniziare dall'analizzare quante volte una parola viene usata nel contesto della persona nel determinato range temporale.
+Come range ho scelto 6 ore, visto che avendo i dati solamente per gli ultimi 9 giorni è interessante analizzare i trend appena nascono.
+```{r}
+words_by_time_politics <- tidy_tweets_politics %>%
+  filter(!str_detect(word, "^@")) %>%
+  mutate(time_floor = floor_date(created_at, unit = "6 hour")) %>%
+  count(time_floor, person, word) %>%
+  group_by(person, time_floor) %>%
+  mutate(time_total = sum(n)) %>%
+  group_by(person, word) %>%
+  mutate(word_total = sum(n)) %>%
+  ungroup() %>%
+  rename(count = n) %>%
+  filter(word_total > 10)
+words_by_time_politics
+
+words_by_time_hpolitics <- tidy_htweets_politics %>%
+  filter(!str_detect(word, "^@")) %>%
+  mutate(time_floor = floor_date(created_at, unit = "6 hour")) %>%
+  count(time_floor, person, word) %>%
+  group_by(person, time_floor) %>%
+  mutate(time_total = sum(n)) %>%
+  group_by(person, word) %>%
+  mutate(word_total = sum(n)) %>%
+  ungroup() %>%
+  rename(count = n) %>%
+  filter(word_total > 10)
+words_by_time_hpolitics
+```
+
+Visto che vogliamo usare i modelli (un modello per ogni parola) annidiamo tutto tranne word e person in un tibble.
+```{r}
+nested_data_politics <- words_by_time_politics %>%
+  nest(-word, -person)
+nested_data_politics
+
+nested_data_hpolitics <- words_by_time_hpolitics %>%
+  nest(-word, -person)
+```
+
+dove un modello contiene
+```{r}
+nested_data_politics$data[1]
+```
+
+## Elaborazione del modello
+Il nostro obiettivo è di modellare la frequenza d'uso delle parole in termine del tempo, tenendo però conto che le frequenze possono variare in un range di valori limitato.
+
+Per questo usiamo un GLM (modello lineare generalizzato).
+```{r}
+library(purrr)
+
+nested_models_politics <- 
+  nested_data_politics %>%
+  mutate(models = map(data,
+                      ~ glm(cbind(count,
+                                  time_total) ~ time_floor,
+                            .,
+                            family = "binomial")))
+nested_models_politics$models[1]
+
+nested_models_hpolitics <- 
+  nested_data_hpolitics %>%
+  mutate(models = map(data,
+                      ~ glm(cbind(count,
+                                  time_total) ~ time_floor,
+                            .,
+                            family = "binomial")))
+```
+Come vediamo abbiamo ottenuto un nested model nel quale per ogni persona e per ogni parola abbiamo l'analisi del modello.
+Di questo quello che ci interessa principlamente è il coefficiente angolare: se quest'ultimo è negativo la frequenza d'uso della parola è decresciuta e viceversa.
+
+Per estrarre il coefficiente angolare del nested model usiamo broom.
+Per evitare di tenere conto anche di coefficienti angolari non statisticamente significativi possiamo applicare un "adjust" al p.value.
+```{r}
+library(broom)
+
+slopes_politics <- nested_models_politics %>%
+  mutate(models = map(models, tidy)) %>% 
+  unnest(cols = c(models)) %>%
+  filter(term == "time_floor") %>%
+  mutate(adjusted.p.value = p.adjust(p.value))
+slopes_politics
+
+slopes_hpolitics <- nested_models_hpolitics %>%
+  mutate(models = map(models, tidy)) %>% 
+  unnest(cols = c(models)) %>%
+  filter(term == "time_floor") %>%
+  mutate(adjusted.p.value = p.adjust(p.value))
+slopes_hpolitics
+```
+
+Filtriamo solo i termini con p.value adjusted significativi.
+```{r}
+top_slopes_politics_salvini <- slopes_politics %>%
+  filter(person == "Salvini") %>%
+  filter(adjusted.p.value < 1)
+top_slopes_politics_conte <- slopes_politics %>%
+  filter(person == "Conte") %>%
+  filter(adjusted.p.value < 1)
+
+top_slopes_politics_hsalvini <- slopes_hpolitics %>%
+  filter(person == "Salvini") %>%
+  filter(adjusted.p.value <= 10^-10)
+top_slopes_politics_hconte <- slopes_hpolitics %>%
+  filter(person == "Conte") %>%
+  filter(adjusted.p.value <= 10^-2)
+```
+
+## Graficazione
+### Visualizzazione grafica per Conte
+```{r}
+words_by_time_politics %>%
+  inner_join(top_slopes_politics_conte,
+             by = c("word", "person")) %>%
+  filter(person == "Conte") %>%
+  ggplot(aes(time_floor, count/time_total, color = word)) +
+  geom_line(size = 1.3) +
+  labs(x = NULL, y = "Conte Word frequency")
+```
+
+### Visualizzazione grafica per Salvini
+```{r}
+words_by_time_politics %>%
+  inner_join(top_slopes_politics_salvini,
+             by = c("word", "person")) %>%
+  filter(person == "Salvini") %>%
+  ggplot(aes(time_floor, count/time_total, color = word)) +
+  geom_line(size = 1.3) +
+  labs(x = NULL, y = "Salvini Word frequency")
+```
+
+### Visualizzazione grafica per i tweet conteneti #conte
+```{r}
+words_by_time_hpolitics %>%
+  inner_join(top_slopes_politics_hconte,
+             by = c("word", "person")) %>%
+  filter(person == "Conte") %>%
+  ggplot(aes(time_floor, count/time_total, color = word)) +
+  geom_line(size = 1.3) +
+  labs(x = NULL, y = "#Conte Word frequency")
+```
+
+### Visualizzazione grafica per i tweet conteneti #salvini
+```{r}
+words_by_time_hpolitics %>%
+  inner_join(top_slopes_politics_hsalvini,
+             by = c("word", "person")) %>%
+  filter(person == "Salvini") %>%
+  ggplot(aes(time_floor, count/time_total, color = word)) +
+  geom_line(size = 1.3) +
+  labs(x = NULL, y = "#Salvini Word frequency")
+```
+
+
+# Sentiment analysis
+
+## OpeNER
+I dati per una sentiment analysis di tipo BING provengono dalla [repository](https://github.com/opener-project/public-sentiment-lexicons/blob/master/propagation_lexicons/it/it.lemma.sy.an.hypo.rels.maxdepth5.seed500.maj.gold.csv) di [OpeNER](https://www.opener-project.eu/), un progetto per il Natural Language Processing finanziato dalla Commissione Europea, gratuito e facilmente adattabile.
+```{r}
+df_bing =
+  read_delim("it.lemma.sy.an.hypo.rels.maxdepth5.seed500.maj.gold.csv",
+             delim = ";",
+             col_names = c("unknown",
+                           "n",
+                           "sentiment",
+                           "confidence",
+                           "word",
+                           "sign"))
+
+df_bing <- df_bing %>%
+  select(word, sentiment) %>%
+  filter(!str_detect(word, "_")) %>%
+  filter(!(word %in% c("conte", "lega")))
+
+df_bing$word <- gsub("Ã", "à", df_bing$word)
+df_bing
+```
+
+## Codice
+```{r}
+sentiment_politics <- tidy_tweets_politics %>%
+  inner_join(df_bing)
+
+sentiment_politics_conte <- tidy_tweets_politics %>%
+  filter(person == "Conte") %>%
+  inner_join(df_bing)
+sentiment_politics_salvini <- tidy_tweets_politics %>%
+  filter(person == "Salvini") %>%
+  inner_join(df_bing)
+
+
+sentiment_hpolitics <- tidy_htweets_politics %>%
+  inner_join(df_bing)
+
+sentiment_politics_hconte <- tidy_htweets_politics %>%
+  filter(person == "Conte") %>%
+  inner_join(df_bing)
+sentiment_politics_hsalvini <- tidy_htweets_politics %>%
+  filter(person == "Salvini") %>%
+  inner_join(df_bing)
+```
+
+### Conteggio
+```{r}
+bing_word_counts_politics_conte <- sentiment_politics_conte %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+bing_word_counts_politics_conte
+
+bing_word_counts_politics_salvini <- sentiment_politics_salvini %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+bing_word_counts_politics_salvini
+
+
+bing_word_counts_politics_hconte <- sentiment_politics_hconte %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+bing_word_counts_politics_hconte
+
+bing_word_counts_politics_hsalvini <-
+  sentiment_politics_hsalvini %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+bing_word_counts_politics_hsalvini
+```
+
+## Graficazione
+### Conte vs Salvini
+```{r}
+bing_word_counts_politics_conte %>%
+  group_by(sentiment) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(y = "Contribution to sentiment of Conte",
+       x = NULL) +
+  coord_flip()
+
+bing_word_counts_politics_salvini %>%
+  group_by(sentiment) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(y = "Contribution to sentiment of Salvini",
+       x = NULL) +
+  coord_flip()
+```
+
+### #Conte vs #Salvini
+```{r}
+bing_word_counts_politics_hconte %>%
+  group_by(sentiment) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(y = "Contribution to sentiment of #Conte",
+       x = NULL) +
+  coord_flip()
+
+bing_word_counts_politics_hsalvini %>%
+  group_by(sentiment) %>%
+  top_n(10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(y = "Contribution to sentiment of #Salvini",
+       x = NULL) +
+  coord_flip()
+```
